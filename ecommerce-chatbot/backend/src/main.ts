@@ -5,14 +5,12 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // Enable CORS
   app.enableCors({
     origin: 'http://localhost:3000',
     methods: 'GET,POST',
     credentials: true,
   });
 
-  // Swagger setup (optional, for API documentation)
   const config = new DocumentBuilder()
     .setTitle('E-commerce Chatbot API')
     .setDescription('API for customer support chatbot')

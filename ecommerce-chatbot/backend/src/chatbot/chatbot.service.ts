@@ -1,169 +1,132 @@
 
-import { Injectable, OnModuleInit } from '@nestjs/common';
-import { parse } from 'csv-parse';
-import * as fs from 'fs';
-import * as path from 'path';
-
-interface Product {
-  id: string;
-  name: string;
-  retail_price: string;
-}
-
-interface Order {
-  order_id: string;
-  status: string;
-  created_at: string;
-}
-
-interface OrderItem {
-  order_id: string;
-  product_id: string;
-}
-
-interface InventoryItem {
-  id: string;
-  product_id: string;
-  product_name: string;
-  sold_at: string | null;
-}
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Conversation } from '../entities/conversation.entity';
+import { InventoryItem } from '../entities/inventory-item.entity';
+import { Order } from '../entities/order.entity';
+import { OrderItem } from '../entities/order-item.entity';
+import { Product } from '../entities/product.entity';
+import { v4 as uuidv4 } from 'uuid';
+import axios from 'axios';
 
 @Injectable()
-export class ChatbotService implements OnModuleInit {
-  private products: Product[] = [];
-  private orders: Order[] = [];
-  private orderItems: OrderItem[] = [];
-  private inventoryItems: InventoryItem[] = [];
+export class ChatbotService {
+  private readonly llmApiUrl = 'https://api.x.ai/v1/chat'; // Placeholder LLM API URL
+  private readonly llmApiKey = 'your-api-key-here'; // Replace with actual API key
 
-  async onModuleInit() {
-    // Load CSV files into memory
-    await this.loadCsv('products.csv', (record) => {
-      this.products.push({
-        id: record.id,
-        name: record.name,
-        retail_price: record.retail_price,
-      });
-    });
+  constructor(
+    @InjectRepository(Conversation)
+    private conversationRepository: Repository<Conversation>,
+    @InjectRepository(InventoryItem)
+    private inventoryItemRepository: Repository<InventoryItem>,
+    @InjectRepository(Order)
+    private orderRepository: Repository<Order>,
+    @InjectRepository(OrderItem)
+    private orderItemRepository: Repository<OrderItem>,
+    @InjectRepository(Product)
+    private productRepository: Repository<Product>,
+  ) {}
 
-    await this.loadCsv('orders.csv', (record) => {
-      this.orders.push({
-        order_id: record.order_id,
-        status: record.status,
-        created_at: record.created_at,
-      });
-    });
-
-    await this.loadCsv('order_items.csv', (record) => {
-      this.orderItems.push({
-        order_id: record.order_id,
-        product_id: record.product_id,
-      });
-    });
-
-    await this.loadCsv('inventory_items.csv', (record) => {
-      this.inventoryItems.push({
-        id: record.id,
-        product_id: record.product_id,
-        product_name: record.product_name,
-        sold_at: record.sold_at || null,
-      });
-    });
-  }
-
-  private async loadCsv(fileName: string, callback: (record: any) => void): Promise<void> {
-    const filePath = path.join(__dirname, '..', '..', 'data', fileName);
-    return new Promise((resolve, reject) => {
-      fs.createReadStream(filePath)
-        .pipe(parse({ columns: true, trim: true }))
-        .on('data', callback)
-        .on('end', resolve)
-        .on('error', reject);
-    });
-  }
-
-  async processMessage(message: string): Promise<string> {
+  async processMessage(userId: number, message: string): Promise<string> {
     const text = message.toLowerCase().trim();
+    const sessionId = uuidv4();
 
-    // Top 5 most sold products query
+    // Fallback to rule-based responses for specific queries
     if (text.includes('top 5') && text.includes('sold') && text.includes('products')) {
-      const productSales = this.inventoryItems
-        .filter((item) => item.sold_at !== null)
-        .reduce((acc, item) => {
-          acc[item.product_id] = (acc[item.product_id] || 0) + 1;
-          return acc;
-        }, {} as Record<string, number>);
+      const topProducts = await this.inventoryItemRepository
+        .createQueryBuilder('ii')
+        .select('p.name', 'name')
+        .addSelect('COUNT(ii.id)', 'unitsSold')
+        .innerJoin(Product, 'p', 'ii.product_id = p.id')
+        .where('ii.sold_at IS NOT NULL')
+        .groupBy('p.id, p.name')
+        .orderBy('unitsSold', 'DESC')
+        .limit(5)
+        .getRawMany();
 
-      const topProducts = Object.entries(productSales)
-        .map(([product_id, unitsSold]) => {
-          const product = this.products.find((p) => p.id === product_id);
-          return { name: product?.name || 'Unknown', unitsSold };
-        })
-        .sort((a, b) => b.unitsSold - a.unitsSold)
-        .slice(0, 5);
-
-      if (topProducts.length === 0) {
-        return 'No sales data available.';
-      }
-
-      return `Top 5 most sold products:\n${topProducts
+      if (!topProducts.length) return 'No sales data available.';
+      const response = `Top 5 most sold products:\n${topProducts
         .map((p, i) => `${i + 1}. ${p.name} - ${p.unitsSold} units sold`)
         .join('\n')}`;
+      await this.saveConversation(userId, sessionId, message, response);
+      return response;
     }
 
-    // Order status query
     const orderIdMatch = text.match(/\d{5}/);
     if (text.includes('order status') && orderIdMatch) {
-      const orderId = orderIdMatch[0];
-      const order = this.orders.find((o) => o.order_id === orderId);
-      if (!order) {
-        return 'Order not found. Please check your order ID.';
-      }
+      const orderId = parseInt(orderIdMatch[0], 10);
+      const order = await this.orderRepository
+        .createQueryBuilder('o')
+        .select(['o.order_id', 'o.status', 'o.created_at'])
+        .addSelect('GROUP_CONCAT(p.name SEPARATOR \', \')', 'items')
+        .innerJoin(OrderItem, 'oi', 'o.order_id = oi.order_id')
+        .innerJoin(Product, 'p', 'oi.product_id = p.id')
+        .where('o.order_id = :orderId', { orderId })
+        .groupBy('o.order_id, o.status, o.created_at')
+        .getRawOne();
 
-      const items = this.orderItems
-        .filter((oi) => oi.order_id === orderId)
-        .map((oi) => {
-          const product = this.products.find((p) => p.id === oi.product_id);
-          return product?.name || 'Unknown';
-        })
-        .filter((name) => name !== 'Unknown');
-
-      return `Order ${orderId} is ${order.status}. Items: ${items.join(', ') || 'None'}. Placed on ${order.created_at.split(' ')[0]}.`;
+      if (!order) return 'Order not found. Please check your order ID.';
+      const response = `Order ${order.order_id} is ${order.status}. Items: ${order.items}. Placed on ${new Date(order.created_at).toISOString().split('T')[0]}.`;
+      await this.saveConversation(userId, sessionId, message, response);
+      return response;
     }
 
-    // Stock query for Classic T-Shirt
     if (text.includes('classic t-shirt') && (text.includes('stock') || text.includes('left'))) {
-      const stock = this.inventoryItems.filter(
-        (item) => item.product_name.toLowerCase() === 'classic t-shirt' && item.sold_at === null,
-      ).length;
-      return `Classic T-Shirt has ${stock} units left in stock.`;
+      const stock = await this.inventoryItemRepository
+        .createQueryBuilder('ii')
+        .select('COUNT(ii.id)', 'stock')
+        .where('ii.product_name LIKE :name', { name: '%Classic T-Shirt%' })
+        .andWhere('ii.sold_at IS NULL')
+        .getRawOne();
+
+      const response = `Classic T-Shirt has ${stock.stock} units left in stock.`;
+      await this.saveConversation(userId, sessionId, message, response);
+      return response;
     }
 
-    // Return policy query
-    if (text.includes('return') || text.includes('refund')) {
-      return 'Returns are accepted within 30 days of purchase. Items must be unused with original tags. Contact support to initiate a return.';
-    }
-
-    // Product availability query
-    if (text.includes('available') || text.includes('stock')) {
-      const productNameMatch = text.match(/(?:available|stock)\s+(?:for|of)\s+([a-z\s-]+)/i);
-      if (productNameMatch) {
-        const productName = productNameMatch[1].trim();
-        const product = this.products.find((p) => p.name.toLowerCase() === productName);
-        if (!product) {
-          return `Product "${productName}" not found.`;
+    // Delegate other queries to LLM
+    try {
+      const llmResponse = await axios.post(
+        this.llmApiUrl,
+        {
+          query: message,
+          context: 'E-commerce support chatbot. Provide answers based on order status, returns, top products, or product availability using the provided database.',
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${this.llmApiKey}`,
+            'Content-Type': 'application/json',
+          },
         }
-        const stock = this.inventoryItems.filter(
-          (item) => item.product_id === product.id && item.sold_at === null,
-        ).length;
-        return `${product.name} is in stock. Price: $${parseFloat(product.retail_price).toFixed(2)}, Available: ${stock} units.`;
-      }
+      );
+      const response = llmResponse.data.response || "I'm sorry, I couldn't process your request.";
+      await this.saveConversation(userId, sessionId, message, response);
+      return response;
+    } catch (error) {
+      console.error('LLM API error:', error);
+      const fallbackResponse = "I'm sorry, something went wrong. Try asking about order status, returns, top products, or product availability.";
+      await this.saveConversation(userId, sessionId, message, fallbackResponse);
+      return fallbackResponse;
     }
+  }
 
-    // General greeting or fallback
-    if (text.includes('hi') || text.includes('hello')) {
-      return 'Hello! How can I assist you with your shopping today?';
+  private async saveConversation(userId: number, sessionId: string, query: string, response: string): Promise<void> {
+    let conversation = await this.conversationRepository.findOne({ where: { session_id: sessionId, user: { id: userId } } });
+    if (!conversation) {
+      conversation = this.conversationRepository.create({ session_id: sessionId, user: { id: userId }, messages: [] });
     }
+    conversation.messages.push({ query, response, timestamp: new Date() });
+    await this.conversationRepository.save(conversation);
+  }
 
-    return "I'm sorry, I didn't understand your request. Try asking about order status, returns, top products, or product availability.";
+  async getConversationHistory(userId: number, sessionId: string): Promise<Conversation> {
+    const conversation = await this.conversationRepository.findOne({ where: { session_id: sessionId, user: { id: userId } } }) || 
+      this.conversationRepository.create({ session_id: sessionId, user: { id: userId }, messages: [] });
+    return conversation;
+  }
+
+  async getConversationCount(): Promise<number> {
+    return this.conversationRepository.count();
   }
 }
